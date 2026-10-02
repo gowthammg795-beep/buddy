@@ -1,4 +1,4 @@
-# 🤖 My Buddy
+# 🤖 My Buddy V1
 
 My Buddy is an intelligent robotic assistant built around the ESP32.
 
