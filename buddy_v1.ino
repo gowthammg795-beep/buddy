@@ -1,761 +1,1336 @@
 /*
-  ================================================================
-                     BUDDY V1 ROBOT
-  ================================================================
+  ============================================================
+                    BUDDY V1 - AI ROBOT
+  ============================================================
+
+  Controller : ESP32 DevKit V1
 
   Features:
-    - Manual movement
-    - Automatic obstacle avoidance
-    - HC-SR04 ultrasonic sensor
-    - OLED animated eyes
-    - OLED blinking animation
-    - Manual / Auto mode
+  - WiFi Access Point
+  - Web dashboard
+  - Manual motor control
+  - Autonomous obstacle avoidance
+  - HC-SR04 ultrasonic sensor
+  - DHT11 temperature + humidity
+  - MQ-2 gas sensor
+  - SSD1306 OLED
+  - SIM900A GSM UART
+  - MAX98357A I2S speaker
+  - Status LED
 
-  Controller:
-    ESP32
+  ============================================================
+                         PIN MAP
+  ============================================================
 
-  Display:
-    SSD1306 OLED 128x64
+  HC-SR04
+    TRIG  -> GPIO 5
+    ECHO  -> GPIO 18
 
-  Motor Driver:
-    TB6612FNG
+  DHT11
+    DATA  -> GPIO 13
 
-  Ultrasonic:
-    HC-SR04
+  MQ-2
+    AO    -> GPIO 34
 
-  ================================================================
+  OLED SSD1306
+    SDA   -> GPIO 21
+    SCL   -> GPIO 22
+
+  SIM900A
+    TXD   -> GPIO 16 (ESP32 RX2)
+    RXD   -> GPIO 17 (ESP32 TX2)
+
+  TB6612FNG
+    AIN1  -> GPIO 26
+    AIN2  -> GPIO 27
+    PWMA  -> GPIO 32
+    BIN1  -> GPIO 33
+    BIN2  -> GPIO 14
+    STBY  -> 3.3V
+
+  MAX98357A
+    BCLK  -> GPIO 19
+    LRC   -> GPIO 22
+    DIN   -> GPIO 21
+
+  STATUS LED
+    GPIO 2
+
+  ============================================================
 */
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <Wire.h>
-#include <U8g2lib.h>
+#include <HardwareSerial.h>
+#include <DHT.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// ================================================================
+#include "driver/i2s.h"
+
+// ============================================================
+// WIFI
+// ============================================================
+
+const char* AP_SSID = "BUDDY-V1";
+const char* AP_PASSWORD = "buddy1234";
+
+WebServer server(80);
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+
+// HC-SR04
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+// DHT11
+#define DHT_PIN 13
+#define DHT_TYPE DHT11
+
+// MQ-2
+#define MQ2_PIN 34
+
 // OLED
-// ================================================================
-
 #define OLED_SDA 21
-#define OLED_SCL 23
+#define OLED_SCL 22
 
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(
-  U8G2_R0,
-  U8X8_PIN_NONE
+// SIM900A
+#define SIM900_RX 16
+#define SIM900_TX 17
+
+// TB6612
+#define AIN1 26
+#define AIN2 27
+#define PWMA 32
+
+#define BIN1 33
+#define BIN2 14
+
+// MAX98357A
+#define I2S_BCLK 19
+#define I2S_LRC 22
+#define I2S_DIN 21
+
+// Status LED
+#define STATUS_LED 2
+
+// ============================================================
+// OBJECTS
+// ============================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+Adafruit_SSD1306 display(
+  128,
+  64,
+  &Wire,
+  -1
 );
 
-// ================================================================
-// MOTOR DRIVER - TB6612FNG
-// ================================================================
+HardwareSerial SIM900(2);
 
-// Motor A
-#define PWMA 4
-#define AIN1 18
-#define AIN2 19
+// ============================================================
+// MOTOR PWM
+// ============================================================
 
-// Motor B
-#define PWMB 5
-#define BIN1 2
-#define BIN2 15
-
-#define STBY 12
-
-// ================================================================
-// ULTRASONIC
-// ================================================================
-
-#define TRIG_PIN 13
-#define ECHO_PIN 14
-
-// ================================================================
-// MODE BUTTON
-// ================================================================
-
-#define MODE_BUTTON 32
-
-// ================================================================
-// MOTOR SPEED
-// ================================================================
+#define MOTOR_PWM_FREQ 20000
+#define MOTOR_PWM_RESOLUTION 8
 
 int motorSpeed = 180;
 
-// ================================================================
-// OBSTACLE SETTINGS
-// ================================================================
+// ============================================================
+// ROBOT STATES
+// ============================================================
 
-#define OBSTACLE_DISTANCE 25
-
-// ================================================================
-// MODES
-// ================================================================
-
-enum RobotMode {
+enum RobotMode
+{
   MANUAL_MODE,
   AUTO_MODE
 };
 
-RobotMode currentMode = MANUAL_MODE;
+RobotMode robotMode = MANUAL_MODE;
 
-// ================================================================
-// MOVEMENT
-// ================================================================
+String motorState = "STOPPED";
 
-enum Movement {
-  STOPPED,
-  FORWARD,
-  BACKWARD,
-  LEFT,
-  RIGHT
-};
+// ============================================================
+// SENSOR VARIABLES
+// ============================================================
 
-Movement currentMovement = STOPPED;
+float distanceCM = 0;
 
-// ================================================================
-// OLED ANIMATION
-// ================================================================
+float temperatureC = 0;
+float humidity = 0;
 
-unsigned long lastEyeUpdate = 0;
-unsigned long lastBlink = 0;
+int gasValue = 0;
 
-bool eyesClosed = false;
+// ============================================================
+// TIMERS
+// ============================================================
 
-int eyeOffset = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastOLEDUpdate = 0;
+unsigned long lastAutoRun = 0;
 
-const unsigned long EYE_UPDATE_TIME = 80;
-const unsigned long BLINK_INTERVAL = 4000;
+const unsigned long SENSOR_INTERVAL = 1000;
+const unsigned long OLED_INTERVAL = 500;
 
-// ================================================================
-// AUTO MODE TIMING
-// ================================================================
+// ============================================================
+// MOTOR FUNCTIONS
+// ============================================================
 
-unsigned long lastAutoAction = 0;
+void setLeftMotor(int speedValue)
+{
+  speedValue = constrain(speedValue, -255, 255);
 
-bool turning = false;
+  if (speedValue > 0)
+  {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    ledcWrite(PWMA, speedValue);
+  }
+  else if (speedValue < 0)
+  {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    ledcWrite(PWMA, -speedValue);
+  }
+  else
+  {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    ledcWrite(PWMA, 0);
+  }
+}
 
-unsigned long turnStart = 0;
+void setRightMotor(int speedValue)
+{
+  speedValue = constrain(speedValue, -255, 255);
 
-int turnDirection = 0;
+  if (speedValue > 0)
+  {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    ledcWrite(PWMA, speedValue);
+  }
+  else if (speedValue < 0)
+  {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    ledcWrite(PWMA, -speedValue);
+  }
+  else
+  {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+  }
+}
 
-// ================================================================
-// SETUP
-// ================================================================
+// ============================================================
+// MOTOR CONTROL
+// ============================================================
 
-void setup() {
+void stopRobot()
+{
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
 
-  Serial.begin(115200);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
 
-  // --------------------------------------------------------------
-  // OLED
-  // --------------------------------------------------------------
+  ledcWrite(PWMA, 0);
 
-  Wire.begin(OLED_SDA, OLED_SCL);
+  motorState = "STOPPED";
+}
 
-  oled.begin();
+void moveForward()
+{
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
 
-  oled.clearBuffer();
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
 
-  oled.setFont(u8g2_font_6x10_tf);
+  ledcWrite(PWMA, motorSpeed);
 
-  oled.drawStr(28, 30, "BUDDY V1");
-  oled.drawStr(20, 45, "INITIALIZING");
+  motorState = "FORWARD";
+}
 
-  oled.sendBuffer();
+void moveBackward()
+{
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, HIGH);
 
-  delay(1000);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, HIGH);
 
-  // --------------------------------------------------------------
-  // MOTOR PINS
-  // --------------------------------------------------------------
+  ledcWrite(PWMA, motorSpeed);
 
-  pinMode(PWMA, OUTPUT);
-  pinMode(AIN1, OUTPUT);
-  pinMode(AIN2, OUTPUT);
+  motorState = "BACKWARD";
+}
 
-  pinMode(PWMB, OUTPUT);
-  pinMode(BIN1, OUTPUT);
-  pinMode(BIN2, OUTPUT);
+void turnLeft()
+{
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, HIGH);
 
-  pinMode(STBY, OUTPUT);
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
 
-  digitalWrite(STBY, HIGH);
+  ledcWrite(PWMA, motorSpeed);
 
-  // --------------------------------------------------------------
-  // ULTRASONIC
-  // --------------------------------------------------------------
+  motorState = "LEFT";
+}
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+void turnRight()
+{
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
 
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, HIGH);
+
+  ledcWrite(PWMA, motorSpeed);
+
+  motorState = "RIGHT";
+}
+
+// ============================================================
+// ULTRASONIC
+// ============================================================
+
+float readDistance()
+{
   digitalWrite(TRIG_PIN, LOW);
-
-  // --------------------------------------------------------------
-  // MODE BUTTON
-  // --------------------------------------------------------------
-
-  pinMode(MODE_BUTTON, INPUT_PULLUP);
-
-  // --------------------------------------------------------------
-  // INITIAL STATE
-  // --------------------------------------------------------------
-
-  stopMotors();
-
-  drawEyes();
-
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println("       BUDDY V1 READY");
-  Serial.println("==============================");
-  Serial.println("MODE: MANUAL");
-  Serial.println("==============================");
-}
-
-// ================================================================
-// MAIN LOOP
-// ================================================================
-
-void loop() {
-
-  handleModeButton();
-
-  updateEyes();
-
-  if (currentMode == MANUAL_MODE) {
-
-    manualMode();
-
-  } else {
-
-    autoMode();
-
-  }
-
-  delay(10);
-}
-
-// ================================================================
-// MODE BUTTON
-// ================================================================
-
-void handleModeButton() {
-
-  static bool lastButtonState = HIGH;
-  static unsigned long lastDebounce = 0;
-
-  bool buttonState = digitalRead(MODE_BUTTON);
-
-  if (buttonState != lastButtonState) {
-
-    lastDebounce = millis();
-
-  }
-
-  if ((millis() - lastDebounce) > 50) {
-
-    if (lastButtonState == HIGH && buttonState == LOW) {
-
-      if (currentMode == MANUAL_MODE) {
-
-        currentMode = AUTO_MODE;
-
-        stopMotors();
-
-        Serial.println("MODE -> AUTO");
-
-      } else {
-
-        currentMode = MANUAL_MODE;
-
-        stopMotors();
-
-        Serial.println("MODE -> MANUAL");
-
-      }
-
-    }
-  }
-
-  lastButtonState = buttonState;
-}
-
-// ================================================================
-// MANUAL MODE
-// ================================================================
-//
-// Serial commands:
-//
-// F = Forward
-// B = Backward
-// L = Left
-// R = Right
-// S = Stop
-// A = Auto
-// M = Manual
-//
-// ================================================================
-
-void manualMode() {
-
-  if (Serial.available()) {
-
-    char command = Serial.read();
-
-    command = toupper(command);
-
-    switch (command) {
-
-      case 'F':
-        moveForward();
-        break;
-
-      case 'B':
-        moveBackward();
-        break;
-
-      case 'L':
-        turnLeft();
-        break;
-
-      case 'R':
-        turnRight();
-        break;
-
-      case 'S':
-        stopMotors();
-        break;
-
-      case 'A':
-
-        currentMode = AUTO_MODE;
-
-        stopMotors();
-
-        Serial.println("MODE -> AUTO");
-
-        break;
-
-      case 'M':
-
-        currentMode = MANUAL_MODE;
-
-        stopMotors();
-
-        Serial.println("MODE -> MANUAL");
-
-        break;
-
-      default:
-        break;
-    }
-  }
-}
-
-// ================================================================
-// AUTO MODE
-// ================================================================
-
-void autoMode() {
-
-  unsigned long now = millis();
-
-  // --------------------------------------------------------------
-  // Continue an active turn
-  // --------------------------------------------------------------
-
-  if (turning) {
-
-    if (now - turnStart < 450) {
-
-      if (turnDirection == 1) {
-
-        turnRight();
-
-      } else {
-
-        turnLeft();
-
-      }
-
-      return;
-
-    }
-
-    turning = false;
-
-    stopMotors();
-
-    delay(80);
-  }
-
-  // --------------------------------------------------------------
-  // Read ultrasonic
-  // --------------------------------------------------------------
-
-  float distance = readDistance();
-
-  Serial.print("AUTO DISTANCE: ");
-  Serial.print(distance);
-  Serial.println(" cm");
-
-  // --------------------------------------------------------------
-  // Obstacle detected
-  // --------------------------------------------------------------
-
-  if (distance > 0 && distance <= OBSTACLE_DISTANCE) {
-
-    Serial.println("OBSTACLE DETECTED!");
-
-    stopMotors();
-
-    delay(120);
-
-    // Choose a turn direction.
-
-    // For a simple V1 robot, alternate directions.
-    static bool alternateTurn = false;
-
-    alternateTurn = !alternateTurn;
-
-    if (alternateTurn) {
-
-      turnDirection = 1;
-
-      Serial.println("AUTO -> RIGHT");
-
-    } else {
-
-      turnDirection = -1;
-
-      Serial.println("AUTO -> LEFT");
-    }
-
-    turning = true;
-
-    turnStart = millis();
-
-    return;
-  }
-
-  // --------------------------------------------------------------
-  // Clear path
-  // --------------------------------------------------------------
-
-  moveForward();
-}
-
-// ================================================================
-// ULTRASONIC DISTANCE
-// ================================================================
-
-float readDistance() {
-
-  digitalWrite(TRIG_PIN, LOW);
-
   delayMicroseconds(3);
 
   digitalWrite(TRIG_PIN, HIGH);
-
   delayMicroseconds(10);
 
   digitalWrite(TRIG_PIN, LOW);
 
-  unsigned long duration =
-    pulseIn(ECHO_PIN, HIGH, 30000);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
 
-  if (duration == 0) {
-
-    return -1;
+  if (duration == 0)
+  {
+    return 999;
   }
 
-  float distance =
-    duration * 0.0343 / 2.0;
+  float distance = duration * 0.0343 / 2.0;
 
   return distance;
 }
 
-// ================================================================
-// MOTOR A
-// ================================================================
+// ============================================================
+// SENSOR READING
+// ============================================================
 
-void motorA(int speedValue) {
+void readSensors()
+{
+  distanceCM = readDistance();
 
-  speedValue = constrain(speedValue, -255, 255);
+  float newTemperature = dht.readTemperature();
+  float newHumidity = dht.readHumidity();
 
-  if (speedValue > 0) {
-
-    digitalWrite(AIN1, HIGH);
-    digitalWrite(AIN2, LOW);
-
-    analogWrite(PWMA, speedValue);
-
-  } else if (speedValue < 0) {
-
-    digitalWrite(AIN1, LOW);
-    digitalWrite(AIN2, HIGH);
-
-    analogWrite(PWMA, -speedValue);
-
-  } else {
-
-    digitalWrite(AIN1, LOW);
-    digitalWrite(AIN2, LOW);
-
-    analogWrite(PWMA, 0);
-  }
-}
-
-// ================================================================
-// MOTOR B
-// ================================================================
-
-void motorB(int speedValue) {
-
-  speedValue = constrain(speedValue, -255, 255);
-
-  if (speedValue > 0) {
-
-    digitalWrite(BIN1, HIGH);
-    digitalWrite(BIN2, LOW);
-
-    analogWrite(PWMB, speedValue);
-
-  } else if (speedValue < 0) {
-
-    digitalWrite(BIN1, LOW);
-    digitalWrite(BIN2, HIGH);
-
-    analogWrite(PWMB, -speedValue);
-
-  } else {
-
-    digitalWrite(BIN1, LOW);
-    digitalWrite(BIN2, LOW);
-
-    analogWrite(PWMB, 0);
-  }
-}
-
-// ================================================================
-// FORWARD
-// ================================================================
-
-void moveForward() {
-
-  currentMovement = FORWARD;
-
-  motorA(motorSpeed);
-  motorB(motorSpeed);
-}
-
-// ================================================================
-// BACKWARD
-// ================================================================
-
-void moveBackward() {
-
-  currentMovement = BACKWARD;
-
-  motorA(-motorSpeed);
-  motorB(-motorSpeed);
-}
-
-// ================================================================
-// LEFT
-// ================================================================
-
-void turnLeft() {
-
-  currentMovement = LEFT;
-
-  motorA(-motorSpeed);
-  motorB(motorSpeed);
-}
-
-// ================================================================
-// RIGHT
-// ================================================================
-
-void turnRight() {
-
-  currentMovement = RIGHT;
-
-  motorA(motorSpeed);
-  motorB(-motorSpeed);
-}
-
-// ================================================================
-// STOP
-// ================================================================
-
-void stopMotors() {
-
-  currentMovement = STOPPED;
-
-  motorA(0);
-  motorB(0);
-}
-
-// ================================================================
-// OLED EYES
-// ================================================================
-
-void updateEyes() {
-
-  unsigned long now = millis();
-
-  // --------------------------------------------------------------
-  // Random/simple blinking
-  // --------------------------------------------------------------
-
-  if (!eyesClosed &&
-      now - lastBlink > BLINK_INTERVAL) {
-
-    eyesClosed = true;
-
-    lastBlink = now;
-
-    drawEyes();
-
-    delay(100);
-
-    eyesClosed = false;
-
-    lastBlink = millis();
-
-    drawEyes();
-
-    return;
+  if (!isnan(newTemperature))
+  {
+    temperatureC = newTemperature;
   }
 
-  // --------------------------------------------------------------
-  // Eye movement
-  // --------------------------------------------------------------
+  if (!isnan(newHumidity))
+  {
+    humidity = newHumidity;
+  }
 
-  if (now - lastEyeUpdate >= EYE_UPDATE_TIME) {
+  gasValue = analogRead(MQ2_PIN);
+}
 
-    lastEyeUpdate = now;
+// ============================================================
+// OLED
+// ============================================================
 
-    eyeOffset++;
+void updateOLED()
+{
+  /*
+    OLED and MAX98357A share GPIO21/GPIO22.
 
-    if (eyeOffset > 4) {
+    OLED is restored here after audio playback.
+  */
 
-      eyeOffset = -4;
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("BUDDY V1");
+
+  display.setCursor(0, 11);
+
+  if (robotMode == AUTO_MODE)
+  {
+    display.println("MODE: AUTO");
+  }
+  else
+  {
+    display.println("MODE: MANUAL");
+  }
+
+  display.setCursor(0, 22);
+  display.print("DIST: ");
+  display.print(distanceCM, 1);
+  display.println(" cm");
+
+  display.setCursor(0, 33);
+  display.print("TEMP: ");
+  display.print(temperatureC, 1);
+  display.println(" C");
+
+  display.setCursor(0, 44);
+  display.print("HUM: ");
+  display.print(humidity, 0);
+  display.println("%");
+
+  display.setCursor(0, 55);
+  display.print(motorState);
+
+  display.display();
+}
+
+// ============================================================
+// I2S AUDIO
+// ============================================================
+
+bool i2sReady = false;
+
+void setupI2SAudio()
+{
+  /*
+    GPIO21 and GPIO22 are shared with OLED.
+    Audio is therefore initialized only when needed.
+  */
+
+  i2s_config_t i2s_config;
+
+  memset(&i2s_config, 0, sizeof(i2s_config));
+
+  i2s_config.mode =
+      (i2s_mode_t)(
+        I2S_MODE_MASTER |
+        I2S_MODE_TX
+      );
+
+  i2s_config.sample_rate = 16000;
+
+  i2s_config.bits_per_sample =
+      I2S_BITS_PER_SAMPLE_16BIT;
+
+  i2s_config.channel_format =
+      I2S_CHANNEL_FMT_RIGHT_LEFT;
+
+  i2s_config.communication_format =
+      I2S_COMM_FORMAT_I2S_MSB;
+
+  i2s_config.intr_alloc_flags = 0;
+
+  i2s_config.dma_buf_count = 8;
+
+  i2s_config.dma_buf_len = 256;
+
+  i2s_config.use_apll = false;
+
+  i2s_config.tx_desc_auto_clear = true;
+
+  i2s_config.fixed_mclk = 0;
+
+  i2s_driver_install(
+    I2S_NUM_0,
+    &i2s_config,
+    0,
+    NULL
+  );
+
+  i2s_pin_config_t pin_config;
+
+  pin_config.bck_io_num = I2S_BCLK;
+  pin_config.ws_io_num = I2S_LRC;
+  pin_config.data_out_num = I2S_DIN;
+  pin_config.data_in_num = I2S_PIN_NO_CHANGE;
+
+  i2s_set_pin(
+    I2S_NUM_0,
+    &pin_config
+  );
+
+  i2sReady = true;
+}
+
+// ============================================================
+// SIMPLE BEEP
+// ============================================================
+
+void playTone(
+  int frequency,
+  int duration
+)
+{
+  if (!i2sReady)
+  {
+    setupI2SAudio();
+  }
+
+  const int sampleRate = 16000;
+
+  int totalSamples =
+      (sampleRate * duration) / 1000;
+
+  const int bufferSamples = 256;
+
+  int16_t buffer[bufferSamples * 2];
+
+  float phase = 0;
+
+  float phaseIncrement =
+      2.0 * PI * frequency / sampleRate;
+
+  for (
+    int sample = 0;
+    sample < totalSamples;
+    sample += bufferSamples
+  )
+  {
+    int samplesToWrite =
+        min(
+          bufferSamples,
+          totalSamples - sample
+        );
+
+    for (
+      int i = 0;
+      i < samplesToWrite;
+      i++
+    )
+    {
+      int16_t value =
+          (int16_t)(
+            sin(phase) * 7000
+          );
+
+      phase += phaseIncrement;
+
+      if (phase >= 2.0 * PI)
+      {
+        phase -= 2.0 * PI;
+      }
+
+      buffer[i * 2] = value;
+      buffer[i * 2 + 1] = value;
     }
 
-    drawEyes();
+    size_t bytesWritten = 0;
+
+    i2s_write(
+      I2S_NUM_0,
+      buffer,
+      samplesToWrite * 2 * sizeof(int16_t),
+      &bytesWritten,
+      portMAX_DELAY
+    );
+  }
+
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  // Return pins to OLED
+  i2s_driver_uninstall(I2S_NUM_0);
+
+  i2sReady = false;
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+}
+
+// ============================================================
+// GSM
+// ============================================================
+
+void sendSMS(
+  String number,
+  String message
+)
+{
+  SIM900.println("AT");
+  delay(500);
+
+  SIM900.println("AT+CMGF=1");
+  delay(500);
+
+  SIM900.print("AT+CMGS=\"");
+  SIM900.print(number);
+  SIM900.println("\"");
+
+  delay(500);
+
+  SIM900.print(message);
+
+  SIM900.write(26);
+
+  delay(5000);
+}
+
+// ============================================================
+// AUTO MODE
+// ============================================================
+
+void runAutonomousMode()
+{
+  if (distanceCM > 25)
+  {
+    moveForward();
+  }
+  else
+  {
+    stopRobot();
+
+    delay(150);
+
+    moveBackward();
+
+    delay(300);
+
+    stopRobot();
+
+    delay(150);
+
+    turnRight();
+
+    delay(500);
+
+    stopRobot();
   }
 }
 
-// ================================================================
-// DRAW OLED EYES
-// ================================================================
+// ============================================================
+// WEB PAGE
+// ============================================================
 
-void drawEyes() {
+String htmlPage()
+{
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html>
 
-  oled.clearBuffer();
+<head>
 
-  // --------------------------------------------------------------
-  // Header
-  // --------------------------------------------------------------
+<meta name="viewport"
+content="width=device-width, initial-scale=1">
 
-  oled.setFont(u8g2_font_5x7_tf);
+<title>BUDDY V1</title>
 
-  if (currentMode == AUTO_MODE) {
+<style>
 
-    oled.drawStr(2, 7, "AUTO");
+body {
+  background:#080d18;
+  color:white;
+  font-family:Arial;
+  text-align:center;
+  margin:0;
+  padding:20px;
+}
 
-  } else {
+h1 {
+  color:#00e5ff;
+}
 
-    oled.drawStr(2, 7, "MANUAL");
-  }
+.card {
+  background:#111827;
+  padding:20px;
+  margin:15px auto;
+  border-radius:15px;
+  max-width:500px;
+}
 
-  // --------------------------------------------------------------
-  // Closed eyes
-  // --------------------------------------------------------------
+button {
+  width:100px;
+  height:55px;
+  margin:5px;
+  border:none;
+  border-radius:12px;
+  font-size:18px;
+  font-weight:bold;
+}
 
-  if (eyesClosed) {
+.forward {
+  background:#22c55e;
+}
 
-    oled.drawLine(18, 32, 45, 32);
-    oled.drawLine(83, 32, 110, 32);
+.back {
+  background:#ef4444;
+}
 
-    oled.sendBuffer();
+.left,
+.right {
+  background:#3b82f6;
+}
+
+.stop {
+  background:#f59e0b;
+}
+
+.auto {
+  background:#8b5cf6;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>🤖 BUDDY V1</h1>
+
+<div class="card">
+
+<h2>Robot Control</h2>
+
+<button
+class="forward"
+onclick="cmd('forward')">
+↑
+</button>
+
+<br>
+
+<button
+class="left"
+onclick="cmd('left')">
+←
+</button>
+
+<button
+class="stop"
+onclick="cmd('stop')">
+STOP
+</button>
+
+<button
+class="right"
+onclick="cmd('right')">
+→
+</button>
+
+<br>
+
+<button
+class="back"
+onclick="cmd('backward')">
+↓
+</button>
+
+</div>
+
+<div class="card">
+
+<h2>Mode</h2>
+
+<button
+class="auto"
+onclick="cmd('auto')">
+AUTO
+</button>
+
+<button
+class="stop"
+onclick="cmd('manual')">
+MANUAL
+</button>
+
+</div>
+
+<div class="card">
+
+<h2>Sensor Data</h2>
+
+<p>Distance:
+<span id="distance">--</span> cm</p>
+
+<p>Temperature:
+<span id="temperature">--</span> °C</p>
+
+<p>Humidity:
+<span id="humidity">--</span> %</p>
+
+<p>MQ-2:
+<span id="gas">--</span></p>
+
+<p>Mode:
+<span id="mode">--</span></p>
+
+<p>Motor:
+<span id="motor">--</span></p>
+
+</div>
+
+<div class="card">
+
+<h2>Audio</h2>
+
+<button
+class="auto"
+onclick="cmd('beep')">
+🔊 BEEP
+</button>
+
+</div>
+
+<script>
+
+function cmd(command)
+{
+  fetch('/cmd?value=' + command);
+}
+
+function updateData()
+{
+  fetch('/data')
+  .then(response => response.json())
+  .then(data => {
+
+    document.getElementById(
+      'distance'
+    ).innerText = data.distance;
+
+    document.getElementById(
+      'temperature'
+    ).innerText = data.temperature;
+
+    document.getElementById(
+      'humidity'
+    ).innerText = data.humidity;
+
+    document.getElementById(
+      'gas'
+    ).innerText = data.gas;
+
+    document.getElementById(
+      'mode'
+    ).innerText = data.mode;
+
+    document.getElementById(
+      'motor'
+    ).innerText = data.motor;
+
+  });
+}
+
+setInterval(updateData, 1000);
+
+updateData();
+
+</script>
+
+</body>
+
+</html>
+)rawliteral";
+
+  return page;
+}
+
+// ============================================================
+// WEB COMMAND HANDLER
+// ============================================================
+
+void handleCommand()
+{
+  if (!server.hasArg("value"))
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Missing command"
+    );
 
     return;
   }
 
-  // --------------------------------------------------------------
-  // Eye positions
-  // --------------------------------------------------------------
+  String command =
+      server.arg("value");
 
-  int leftX  = 17 + eyeOffset;
-  int rightX = 82 + eyeOffset;
-
-  // --------------------------------------------------------------
-  // Eye shapes
-  // --------------------------------------------------------------
-
-  oled.drawRBox(
-    leftX,
-    19,
-    29,
-    29,
-    7
-  );
-
-  oled.drawRBox(
-    rightX,
-    19,
-    29,
-    29,
-    7
-  );
-
-  // --------------------------------------------------------------
-  // Pupils
-  // --------------------------------------------------------------
-
-  oled.setDrawColor(0);
-
-  oled.drawDisc(
-    leftX + 15,
-    33,
-    6
-  );
-
-  oled.drawDisc(
-    rightX + 15,
-    33,
-    6
-  );
-
-  oled.setDrawColor(1);
-
-  // --------------------------------------------------------------
-  // Movement indicator
-  // --------------------------------------------------------------
-
-  oled.setFont(u8g2_font_5x7_tf);
-
-  switch (currentMovement) {
-
-    case FORWARD:
-      oled.drawStr(53, 60, "F");
-      break;
-
-    case BACKWARD:
-      oled.drawStr(53, 60, "B");
-      break;
-
-    case LEFT:
-      oled.drawStr(53, 60, "L");
-      break;
-
-    case RIGHT:
-      oled.drawStr(53, 60, "R");
-      break;
-
-    default:
-      oled.drawStr(53, 60, "S");
-      break;
+  if (command == "forward")
+  {
+    robotMode = MANUAL_MODE;
+    moveForward();
   }
 
-  oled.sendBuffer();
+  else if (command == "backward")
+  {
+    robotMode = MANUAL_MODE;
+    moveBackward();
+  }
+
+  else if (command == "left")
+  {
+    robotMode = MANUAL_MODE;
+    turnLeft();
+  }
+
+  else if (command == "right")
+  {
+    robotMode = MANUAL_MODE;
+    turnRight();
+  }
+
+  else if (command == "stop")
+  {
+    robotMode = MANUAL_MODE;
+    stopRobot();
+  }
+
+  else if (command == "auto")
+  {
+    robotMode = AUTO_MODE;
+    stopRobot();
+  }
+
+  else if (command == "manual")
+  {
+    robotMode = MANUAL_MODE;
+    stopRobot();
+  }
+
+  else if (command == "beep")
+  {
+    playTone(1000, 300);
+  }
+
+  server.send(
+    200,
+    "text/plain",
+    "OK"
+  );
+}
+
+// ============================================================
+// WEB DATA
+// ============================================================
+
+void handleData()
+{
+  String mode;
+
+  if (robotMode == AUTO_MODE)
+  {
+    mode = "AUTO";
+  }
+  else
+  {
+    mode = "MANUAL";
+  }
+
+  String json = "{";
+
+  json += "\"distance\":";
+  json += String(distanceCM, 1);
+
+  json += ",";
+
+  json += "\"temperature\":";
+  json += String(temperatureC, 1);
+
+  json += ",";
+
+  json += "\"humidity\":";
+  json += String(humidity, 1);
+
+  json += ",";
+
+  json += "\"gas\":";
+  json += String(gasValue);
+
+  json += ",";
+
+  json += "\"mode\":\"";
+  json += mode;
+  json += "\"";
+
+  json += ",";
+
+  json += "\"motor\":\"";
+  json += motorState;
+  json += "\"";
+
+  json += "}";
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+// ============================================================
+// WEB SERVER
+// ============================================================
+
+void setupWebServer()
+{
+  server.on(
+    "/",
+    HTTP_GET,
+    []()
+    {
+      server.send(
+        200,
+        "text/html",
+        htmlPage()
+      );
+    }
+  );
+
+  server.on(
+    "/cmd",
+    HTTP_GET,
+    handleCommand
+  );
+
+  server.on(
+    "/data",
+    HTTP_GET,
+    handleData
+  );
+
+  server.begin();
+
+  Serial.println("Web server started");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("       BUDDY V1 ROBOT");
+  Serial.println("==============================");
+
+  // ----------------------------------------------------------
+  // GPIO
+  // ----------------------------------------------------------
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  pinMode(STATUS_LED, OUTPUT);
+
+  digitalWrite(STATUS_LED, LOW);
+
+  // ----------------------------------------------------------
+  // MOTOR PWM
+  // ----------------------------------------------------------
+
+  ledcAttach(
+    PWMA,
+    MOTOR_PWM_FREQ,
+    MOTOR_PWM_RESOLUTION
+  );
+
+  stopRobot();
+
+  // ----------------------------------------------------------
+  // DHT
+  // ----------------------------------------------------------
+
+  dht.begin();
+
+  // ----------------------------------------------------------
+  // MQ2
+  // ----------------------------------------------------------
+
+  pinMode(MQ2_PIN, INPUT);
+
+  // ----------------------------------------------------------
+  // OLED
+  // ----------------------------------------------------------
+
+  Wire.begin(
+    OLED_SDA,
+    OLED_SCL
+  );
+
+  if (!display.begin(
+        SSD1306_SWITCHCAPVCC,
+        0x3C
+      ))
+  {
+    Serial.println("OLED not found!");
+  }
+  else
+  {
+    display.clearDisplay();
+
+    display.setTextSize(1);
+    display.setTextColor(
+      SSD1306_WHITE
+    );
+
+    display.setCursor(0, 0);
+
+    display.println(
+      "BUDDY V1"
+    );
+
+    display.println();
+
+    display.println(
+      "Starting..."
+    );
+
+    display.display();
+  }
+
+  // ----------------------------------------------------------
+  // SIM900A
+  // ----------------------------------------------------------
+
+  SIM900.begin(
+    9600,
+    SERIAL_8N1,
+    SIM900_RX,
+    SIM900_TX
+  );
+
+  Serial.println(
+    "SIM900A UART ready"
+  );
+
+  // ----------------------------------------------------------
+  // WIFI ACCESS POINT
+  // ----------------------------------------------------------
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(
+    AP_SSID,
+    AP_PASSWORD
+  );
+
+  Serial.println();
+  Serial.println(
+    "WiFi AP started"
+  );
+
+  Serial.print(
+    "SSID: "
+  );
+
+  Serial.println(
+    AP_SSID
+  );
+
+  Serial.print(
+    "IP Address: "
+  );
+
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+  // ----------------------------------------------------------
+  // WEB SERVER
+  // ----------------------------------------------------------
+
+  setupWebServer();
+
+  // ----------------------------------------------------------
+  // STARTUP LED
+  // ----------------------------------------------------------
+
+  digitalWrite(
+    STATUS_LED,
+    HIGH
+  );
+
+  delay(500);
+
+  digitalWrite(
+    STATUS_LED,
+    LOW
+  );
+
+  // ----------------------------------------------------------
+  // STARTUP BEEP
+  // ----------------------------------------------------------
+
+  playTone(
+    1000,
+    200
+  );
+
+  Serial.println();
+  Serial.println(
+    "BUDDY V1 READY!"
+  );
+
+  Serial.print(
+    "Open: http://"
+  );
+
+  Serial.print(
+    WiFi.softAPIP()
+  );
+
+  Serial.println();
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+  // ----------------------------------------------------------
+  // WEB SERVER
+  // ----------------------------------------------------------
+
+  server.handleClient();
+
+  // ----------------------------------------------------------
+  // SENSOR READING
+  // ----------------------------------------------------------
+
+  if (
+    millis() - lastSensorRead
+    >= SENSOR_INTERVAL
+  )
+  {
+    lastSensorRead =
+        millis();
+
+    readSensors();
+
+    Serial.println();
+    Serial.println(
+      "----- SENSOR DATA -----"
+    );
+
+    Serial.print(
+      "Distance: "
+    );
+
+    Serial.print(
+      distanceCM
+    );
+
+    Serial.println(
+      " cm"
+    );
+
+    Serial.print(
+      "Temperature: "
+    );
+
+    Serial.print(
+      temperatureC
+    );
+
+    Serial.println(
+      " C"
+    );
+
+    Serial.print(
+      "Humidity: "
+    );
+
+    Serial.print(
+      humidity
+    );
+
+    Serial.println(
+      " %"
+    );
+
+    Serial.print(
+      "MQ2: "
+    );
+
+    Serial.println(
+      gasValue
+    );
+  }
+
+  // ----------------------------------------------------------
+  // AUTO MODE
+  // ----------------------------------------------------------
+
+  if (
+    robotMode == AUTO_MODE
+  )
+  {
+    if (
+      millis() - lastAutoRun
+      >= 100
+    )
+    {
+      lastAutoRun =
+          millis();
+
+      if (distanceCM < 25)
+      {
+        stopRobot();
+
+        digitalWrite(
+          STATUS_LED,
+          HIGH
+        );
+
+        delay(100);
+
+        turnRight();
+
+        delay(300);
+
+        stopRobot();
+
+        digitalWrite(
+          STATUS_LED,
+          LOW
+        );
+      }
+      else
+      {
+        moveForward();
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // OLED
+  // ----------------------------------------------------------
+
+  if (
+    millis() - lastOLEDUpdate
+    >= OLED_INTERVAL
+  )
+  {
+    lastOLEDUpdate =
+        millis();
+
+    updateOLED();
+  }
 }
